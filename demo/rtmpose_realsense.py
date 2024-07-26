@@ -23,14 +23,18 @@ except (ImportError, ModuleNotFoundError):
 
 local_runtime = True
 
+#use rtmpose for realtime, body26 to get 26 keypoints
 det_config = 'projects/rtmpose/rtmdet/person/rtmdet_nano_320-8xb32_coco-person.py'
 det_checkpoint = 'https://download.openmmlab.com/mmpose/v1/projects/rtmpose/rtmdet_nano_8xb32-100e_coco-obj365-person-05d8511e.pth'
 pose_config = 'projects/rtmpose/rtmpose/body_2d_keypoint/rtmpose-t_8xb1024-700e_body8-halpe26-256x192.py'
 pose_checkpoint = 'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/1/rtmpose-t_simcc-body7_pt-body7-halpe26_700e-256x192-6020f8a6_20230605.pth'
 
-
 device = 'cuda:0'
 cfg_options = dict(model=dict(test_cfg=dict(output_heatmaps=False)))
+
+keypoints_list = []
+score_list = []
+
 
 # build detector
 detector = init_detector(
@@ -51,9 +55,17 @@ pose_estimator = init_pose_estimator(
 pose_estimator.cfg.visualizer.radius = 3
 pose_estimator.cfg.visualizer.line_width = 1
 visualizer = VISUALIZERS.build(pose_estimator.cfg.visualizer)
-# the dataset_meta is loaded from the checkpoint and
-# then pass to the model in init_pose_estimator
 visualizer.set_dataset_meta(pose_estimator.dataset_meta)
+
+def save_keypoints_and_bboxes_to_file(keypoints_list, score_list, file_path):
+    """Save keypoints and bounding box scores to a file."""
+    with open(file_path, 'w') as f:
+        for i, (keypoints, bbox_scores) in enumerate(zip(keypoints_list, score_list)):
+            keypoints_2d = keypoints  # Extract x, y coordinates
+            keypoints_str = ','.join(map(str, keypoints_2d.flatten()))
+            score_str = ','.join(map(str, bbox_scores.flatten()))
+            combined_str = f"{i},{score_str},{keypoints_str}"
+            f.write(f"{combined_str}\n")
 
 def get_device_serial_numbers():
     """Get a list of serial numbers for connected RealSense devices."""
@@ -76,14 +88,13 @@ def process_realsense_multi(detector, pose_estimator, visualizer, show_interval=
         pipeline.start(config)
         pipelines.append(pipeline)
     
-    saving = False
-    pred_instances_list = []
     frame_idx = 0
-    output_root = './output'
+    output_root = './demo'
     mmengine.mkdir_or_exist(output_root)
-    pred_save_path = f'{output_root}/results_realsense.json'
+    pred_save_path = f'{output_root}/results_realsense.txt'
     
     try:
+        recording = False
         while True:
             frames_list = [pipeline.wait_for_frames().get_color_frame() for pipeline in pipelines]
             if not all(frames_list):
@@ -111,15 +122,20 @@ def process_realsense_multi(detector, pose_estimator, visualizer, show_interval=
                 # Predict keypoints
                 pose_results = inference_topdown(pose_estimator, frame_rgb, bboxes)
                 data_samples = merge_data_samples(pose_results)
-                
-                if saving:
-                    # save prediction results
-                    pred_instances_list.append(
-                        dict(
-                            frame_id=frame_idx,
-                            camera_id=idx,
-                            instances=split_instances(data_samples.get('pred_instances', None))))
-                
+                print(pose_results)
+
+                if len(pose_results) > 0:
+                    keypoints = pose_results[0].pred_instances.keypoints
+                    bbox_scores = pose_results[0].pred_instances.bbox_scores
+                else:
+                    keypoints = np.array([])
+                    bbox_scores = np.array([])
+
+                # If recording, append keypoints and scores to lists
+                if recording:
+                    keypoints_list.append(keypoints)
+                    score_list.append(bbox_scores)
+
                 # Show the results
                 visualizer.add_datasample(
                     'result',
@@ -142,31 +158,24 @@ def process_realsense_multi(detector, pose_estimator, visualizer, show_interval=
                 # Display the frame using OpenCV
                 cv2.imshow(f'Visualization Result {idx}', vis_result_bgr)
             
-            # Press 'q' to exit the loop, 's' to start/stop saving
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
-                saving = not saving
-                if saving:
-                    print("Started saving keypoints.")
-                else:
-                    print("Stopped saving keypoints.")
-        
+                recording = True
+                print("Recording started...")
+            elif key == ord('e'):
+                recording = False
+                print("Recording stopped...")
+
     finally:
         for pipeline in pipelines:
             pipeline.stop()
         cv2.destroyAllWindows()
         
-        if pred_instances_list:
-            with open(pred_save_path, 'w') as f:
-                json.dump(
-                    dict(
-                        meta_info=pose_estimator.dataset_meta,
-                        instance_info=pred_instances_list),
-                    f,
-                    indent='\t')
-            print(f'predictions have been saved at {pred_save_path}')
+        # Save keypoints and bbox scores to file at the end
+        save_keypoints_and_bboxes_to_file(keypoints_list, score_list, pred_save_path)
+        print(f'Keypoints and bbox scores have been saved at {pred_save_path}')
 
 process_realsense_multi(
     detector,
